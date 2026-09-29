@@ -1112,39 +1112,70 @@ _sfctr:
     inc.w snes_frame_count_svg                          ; increment current frame counter
 
 _sfctr1:
+    ; fps / 10 -> x (tens), fps mod 10 -> y (units)
+    ; The hardware divider is shared with tcc__udiv (libtcc.asm): take its lock,
+    ; and divide by software if it is in use (we interrupted a division).
+    rep #$20
+    lda.l tcc__hwlock
+    bne _sfsoft
+    inc a
+    sta.l tcc__hwlock
     sep #$20
     lda.l snes_frame_count
     sta.l $4204
     lda.l snes_frame_count+1                            ; Write $fps to dividend
     sta.l $4205
-    LDA #10                                             ; Write 10 to divisor (to have fps/10 for 1st char)
-    sta.l $4206                                         ; Wait 16 machine cycles after (done by code)
- 
-    lda #$80	                                        ; VRAM_INCHIGH | VRAM_ADRTR_0B | VRAM_ADRSTINC_1  set address in VRam for read or write ($2116) + block size transfer ($2115)
+    lda.b #10                                           ; Write 10 to divisor (to have fps/10 for 1st char)
+    sta.l $4206                                         ; Wait 16 machine cycles after
+    rep #$20
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    nop
+    lda.l $4214                                         ; quotient (fps / 10)
+    tax
+    lda.l $4216                                         ; remainder (fps mod 10)
+    tay
+    lda.w #0
+    sta.l tcc__hwlock
+    bra _sfdraw
+
+_sfsoft:
+    lda.l snes_frame_count                              ; <= 99: repeated subtraction
+    ldx.w #0
+-   cmp.w #10
+    bcc +
+    sbc.w #10                                           ; carry is set by cmp
+    inx
+    bra -
++   tay
+
+_sfdraw:
+    sep #$20
+    lda.b #$80	                                        ; VRAM_INCHIGH | VRAM_ADRTR_0B | VRAM_ADRSTINC_1  set address in VRam for read or write ($2116) + block size transfer ($2115)
     sta.l $2115
     rep #$20
     lda.l txt_vram_bg
-    clc 
-    adc #(1*32+1)                                       ; will put at location 1,1 on character vram BG
+    clc
+    adc.w #(1*32+1)                                     ; will put at location 1,1 on character vram BG
     sta.l $2116
 
-    sep #$20
-    lda.l $4214                                         ; A = result low byte ($4215 result high byte)
+    txa                                                 ; tens
+    and.w #$00FF
     clc
-    adc #$10                                            ; to have number 0 of graphic
-	rep #$20
-    and #$00FF
-    clc 
-    adc.l txt_vram_offset                                 ; add text offset and put 16 bit value to VRAM
+    adc.w #$10                                          ; to have number 0 of graphic
+    clc
+    adc.l txt_vram_offset                               ; add text offset and put 16 bit value to VRAM
     sta.l $2118
 
-    sep #$20
-    lda.l $4216                                         ; A = remainder low byte ($4216 remainder high byte) (so fps mod 10)
+    tya                                                 ; units
+    and.w #$00FF
     clc
-    adc #$10                                            ; to have number 0 of graphic
-	rep #$20
-    and #$00FF
-    clc 
+    adc.w #$10                                          ; to have number 0 of graphic
+    clc
     adc.l txt_vram_offset
 	sta.l $2118                                         ; add text offset and put 16 bit value to VRAM
 

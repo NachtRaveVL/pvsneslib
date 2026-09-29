@@ -160,7 +160,7 @@ L'outillage de test de `mos2wla` (émulateur sans interface, comparaison d'écra
 
 ### Sur la piste retenue (optimiser 816-tcc)
 
-1. **Consolider** : faire passer `showFPScounter` par le verrou `tcc__hwlock`, compiler 816-opt sous Linux et macOS (seul Windows a été fait), retirer `-liconv` du Makefile de 816-opt.
+1. **Consolider** : compiler 816-opt sous Linux et macOS (seul Windows a été fait). Vérifier dans l'environnement officiel de build Windows (MSYS2 ?) si le `-liconv` du Makefile de 816-opt peut être retiré : il est inutile avec w64devkit, où il faut redéfinir `LDFLAGS`.
 2. **Mesurer sur un vrai jeu** pour savoir où part le temps CPU hors du banc synthétique : appels de fonction, pointeurs, boucles. Candidat retenu : **rick1** (Rick Dangerous, `C:\svgexterne\vboxshared\DropboxSvnClient\snes\rick1`).
    - Idée : jouer un passage scripté (premier écran, chute dans le puits, rocher) avec `run_rom.py` (`RUN_ROM_INPUT`, `RUN_ROM_WATCH`), et compter les frames avec la chaîne d'origine puis avec la chaîne actuelle.
    - Scénario qui fonctionne (LoROM SlowROM) : A aux frames 600, 720 et 960 (titre, choix du niveau, histoire), puis RIGHT de 1100 à 1500. Rick tombe dans le puits vers la frame 1290 et le défilement commence vers 1310.
@@ -282,7 +282,7 @@ Variables d'environnement de 816-opt : `OPT816_NOFLOW=1` désactive l'analyse, `
 - **Pile de tcc limitée** : tcc ne gère pas plus de 255 octets de variables locales par fonction, l'adressage `d,s` étant sur 8 bits. L'assembleur échoue alors avec « Out of 8-bit range ».
 - **`make release`** ne fait pas de `clean` au préalable (voir §7).
 - **Callbacks VBlank (`nmiSet`)** : appeler `consoleVblank()` en premier. Une écriture en VRAM faite après la fin du VBlank est ignorée par la console et par Mesen, alors que snes9x l'accepte : la première version de multest s'affichait dans snes9x mais pas dans Mesen.
-- **`showFPScounter`** utilise le diviseur matériel sans passer par le verrou. Appelé depuis une callback VBlank, il peut fausser une division en cours dans le programme principal.
+- **`showFPScounter`** (videos.asm) utilisait le diviseur matériel sans verrou. **Corrigé** : il prend `tcc__hwlock`, et divise par 10 en logiciel si le diviseur est occupé. Les deux voies affichent le même résultat au pixel près.
 
 ### Limites connues
 
