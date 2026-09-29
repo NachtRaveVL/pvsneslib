@@ -99,6 +99,264 @@ int isControl(const char *a)
 }
 
 /**
+ * @brief Compare + branch fusion.
+    tcc turns every comparison into a boolean in X, then tests it:
+        ldx #1
+        [lda <left>]
+        sec
+        sbc <right>
+        tay
+        <block setting X to 0 or 1 from the flags>
+        stx.b tcc__rN
+        txa
+        bne + (jump to L if false) / beq + (jump to L if true)
+        brl L
+        +
+    This is replaced by a branch on the flags of the subtraction (cmp when the
+    V flag is not needed). A, X, Y and tcc__rN are dead after the test; a tya
+    right after means a long long comparison, which still needs Y.
+ */
+enum { CMP_EQ, CMP_NE, CMP_GT, CMP_LE, CMP_LT, CMP_GE, CMP_UGT, CMP_ULE, CMP_ULT, CMP_UGE, CMP_NB };
+
+static const char *cmpBlocks[CMP_NB][9] = {
+    [CMP_EQ] = {"beq +", "dex", "+", NULL},
+    [CMP_NE] = {"bne +", "dex", "+", NULL},
+    [CMP_GT] = {"beq ++", "bvc +", "eor #$8000", "+", "bpl +++", "++", "dex", "+++", NULL},
+    [CMP_LE] = {"beq +++", "bvc +", "eor #$8000", "+", "bmi +++", "++", "dex", "+++", NULL},
+    [CMP_LT] = {"bvc +", "eor #$8000", "+", "bmi +++", "++", "dex", "+++", NULL},
+    [CMP_GE] = {"bvc +", "eor #$8000", "+", "bpl +++", "++", "dex", "+++", NULL},
+    [CMP_UGT] = {"beq +", "bcs ++", "+ dex", "++", NULL},
+    [CMP_ULE] = {"beq ++", "bcc ++", "+ dex", "++", NULL},
+    [CMP_ULT] = {"bcc ++", "+ dex", "++", NULL},
+    [CMP_UGE] = {"bcs ++", "+ dex", "++", NULL},
+};
+
+static const int cmpInverse[CMP_NB] = {
+    [CMP_EQ] = CMP_NE, [CMP_NE] = CMP_EQ, [CMP_GT] = CMP_LE, [CMP_LE] = CMP_GT,
+    [CMP_LT] = CMP_GE, [CMP_GE] = CMP_LT, [CMP_UGT] = CMP_ULE, [CMP_ULE] = CMP_UGT,
+    [CMP_ULT] = CMP_UGE, [CMP_UGE] = CMP_ULT,
+};
+
+/* Branches jumping to L when the condition is false (L is reached by "brl L") */
+static const char *cmpJumps[CMP_NB][9] = {
+    [CMP_EQ] = {"beq +", "@", "+", NULL},
+    [CMP_NE] = {"bne +", "@", "+", NULL},
+    [CMP_GT] = {"beq ++", "bvc +", "eor #$8000", "+", "bpl +++", "++", "@", "+++", NULL},
+    [CMP_LE] = {"beq +++", "bvc +", "eor #$8000", "+", "bmi +++", "@", "+++", NULL},
+    [CMP_LT] = {"bvc +", "eor #$8000", "+", "bmi +", "@", "+", NULL},
+    [CMP_GE] = {"bvc +", "eor #$8000", "+", "bpl +", "@", "+", NULL},
+    [CMP_UGT] = {"beq ++", "bcs +", "++", "@", "+", NULL},
+    [CMP_ULE] = {"beq +", "bcc +", "@", "+", NULL},
+    [CMP_ULT] = {"bcc +", "@", "+", NULL},
+    [CMP_UGE] = {"bcs +", "@", "+", NULL},
+};
+
+static const char *jumpTarget(const char *l);
+
+static size_t fuseCompare(const dynArray file, size_t i, dynArray *out)
+{
+    size_t k = i + 1, lda = 0, sbc, n;
+    int cond = -1;
+
+    if (!matchStr(file.arr[i], "ldx #1"))
+        return 0;
+    if (k < file.used && startWith(file.arr[k], "lda"))
+        lda = k++;
+    if (k + 2 >= file.used || !matchStr(file.arr[k], "sec") || !startWith(file.arr[k + 1], "sbc")
+        || !matchStr(file.arr[k + 2], "tay"))
+        return 0;
+    sbc = k + 1;
+    k += 3;
+
+    for (int c = 0; c < CMP_NB && cond < 0; c++) {
+        for (n = 0; cmpBlocks[c][n]; n++) {
+            if (k + n >= file.used || !matchStr(file.arr[k + n], cmpBlocks[c][n]))
+                break;
+        }
+        if (!cmpBlocks[c][n])
+            cond = c;
+    }
+    if (cond < 0)
+        return 0;
+    for (n = 0; cmpBlocks[cond][n]; n++)
+        ;
+    k += n;
+
+    if (k + 2 >= file.used || !startWith(file.arr[k], "stx.b tcc__r") || !matchStr(file.arr[k + 1], "txa"))
+        return 0;
+    if (matchStr(file.arr[k + 2], "beq +"))
+        cond = cmpInverse[cond]; // jumps to L when true
+    else if (!matchStr(file.arr[k + 2], "bne +"))
+        return 0;
+    /* labels before the brl: other jumps (&&, ||, long long) land on the brl */
+    size_t labels = k + 3, brl = labels;
+    while (brl < file.used && endWith(file.arr[brl], ":"))
+        brl++;
+    if (brl + 2 >= file.used || !jumpTarget(file.arr[brl]) || !matchStr(file.arr[brl + 1], "+")
+        || matchStr(file.arr[brl + 2], "tya"))
+        return 0;
+
+    if (lda)
+        *out = pushToArray(*out, file.arr[lda]);
+    if (cond == CMP_GT || cond == CMP_LE || cond == CMP_LT || cond == CMP_GE) {
+        *out = pushToArray(*out, "sec");
+        *out = pushToArray(*out, file.arr[sbc]);
+    } else {
+        char *cmp = replaceStr(file.arr[sbc], "sbc", "cmp");
+        *out = pushToArray(*out, cmp);
+    }
+    for (n = 0; cmpJumps[cond][n]; n++) {
+        if (matchStr(cmpJumps[cond][n], "@")) {
+            for (size_t l = labels; l < brl; l++)
+                *out = pushToArray(*out, file.arr[l]);
+            *out = pushToArray(*out, file.arr[brl]);
+        } else
+            *out = pushToArray(*out, (char *) cmpJumps[cond][n]);
+    }
+
+    return brl + 2 - i;
+}
+
+/**
+ * @brief Tell if the label is defined close enough for an 8-bit branch placed at
+    line i. Lines are at most 4 bytes; directives (unknown size) stop the search.
+ */
+#define NEAR_LINES 28
+
+static int isNearLabel(const dynArray file, size_t i, const char *label)
+{
+    char def[MAXLEN_LINE];
+
+    snprintf(def, sizeof(def), "%s:", label);
+    for (size_t j = i + 1; j < file.used && j <= i + NEAR_LINES; j++) {
+        if (matchStr(file.arr[j], def))
+            return 1;
+        if (file.arr[j][0] == '.')
+            break;
+    }
+    for (size_t j = i; j-- > 0 && j + NEAR_LINES >= i;) {
+        if (matchStr(file.arr[j], def))
+            return 1;
+        if (file.arr[j][0] == '.')
+            break;
+    }
+    return 0;
+}
+
+/**
+ * @brief Tell if an anonymous "+" label defined at line i is only used by the
+    branch at line i - 2 (no other branch before it targets the same label).
+ */
+static int plusOnlyUsedBy(const dynArray file, size_t branch)
+{
+    for (size_t j = branch; j-- > 0;) {
+        const char *l = file.arr[j];
+        if (matchStr(l, "+") || startWith(l, "+ "))
+            return 1; // earlier branches target this earlier "+"
+        if (endWith(l, " +"))
+            return 0;
+    }
+    return 1;
+}
+
+static const char *invBranch(const char *b)
+{
+    static const char *pairs[][2] = {{"bcc", "bcs"}, {"bcs", "bcc"}, {"beq", "bne"}, {"bne", "beq"},
+                                     {"bmi", "bpl"}, {"bpl", "bmi"}, {"bvc", "bvs"}, {"bvs", "bvc"}};
+    for (size_t k = 0; k < sizeof(pairs) / sizeof(pairs[0]); k++)
+        if (startWith(b, pairs[k][0]) && b[3] == ' ')
+            return pairs[k][1];
+    return NULL;
+}
+
+/**
+ * @brief Branch over a long branch:
+        bXX +                      bXX M          (M close)
+        brl L            =>        brl L
+        +
+        bra M / jmp.w M
+    or, without the jump after it and L close: b(!XX) L
+ */
+static size_t branchOverBrl(const dynArray file, size_t i, dynArray *out)
+{
+    char buf[MAXLEN_LINE];
+    const char *inv;
+
+    if (i + 2 >= file.used || !endWith(file.arr[i], " +") || !(inv = invBranch(file.arr[i]))
+        || !jumpTarget(file.arr[i + 1]) || !matchStr(file.arr[i + 2], "+")
+        || !plusOnlyUsedBy(file, i))
+        return 0;
+    /* test of a boolean made by a comparison: leave it to fuseCompare */
+    if (i > 0
+        && (matchStr(file.arr[i - 1], "txa")
+            || (i > 1 && startWith(file.arr[i - 2], "stx.b tcc__r")
+                && startWith(file.arr[i - 1], "lda.b tcc__r"))))
+        return 0;
+
+    const char *far = jumpTarget(file.arr[i + 1]);
+    if (i + 3 < file.used && (startWith(file.arr[i + 3], "bra ") || startWith(file.arr[i + 3], "jmp.w "))) {
+        const char *next = file.arr[i + 3] + (file.arr[i + 3][0] == 'b' ? 4 : 6);
+        if (next[0] != '+' && next[0] != '-' && isNearLabel(file, i, next)) {
+            snprintf(buf, sizeof(buf), "%.3s %s", file.arr[i], next);
+            *out = pushToArray(*out, buf);
+            *out = pushToArray(*out, file.arr[i + 1]);
+            return 4;
+        }
+    }
+    if (isNearLabel(file, i, far)) {
+        snprintf(buf, sizeof(buf), "%s %s", inv, far);
+        *out = pushToArray(*out, buf);
+        return 3;
+    }
+    return 0;
+}
+
+/**
+ * @brief Jump threading: an unconditional jump to a label whose first
+    instruction is another unconditional jump goes directly to the final target
+    (jmp.w: as fast as a taken bra, same bank since it is the same section).
+ */
+static const char *jumpTarget(const char *l)
+{
+    if (startWith(l, "bra ") || startWith(l, "brl "))
+        return l + 4;
+    if (startWith(l, "jmp.w "))
+        return l + 6;
+    return NULL;
+}
+
+static size_t threadJump(const dynArray file, size_t i, dynArray *out)
+{
+    char def[MAXLEN_LINE], buf[MAXLEN_LINE];
+    const char *target = jumpTarget(file.arr[i]), *final = NULL, *seen[8];
+    int nseen = 0;
+
+    if (!target || target[0] == '+' || target[0] == '-')
+        return 0;
+    seen[nseen++] = target;
+    while (nseen < 8) {
+        size_t j;
+        snprintf(def, sizeof(def), "%s:", target);
+        for (j = 0; j < file.used && !matchStr(file.arr[j], def); j++)
+            ;
+        while (++j < file.used && endWith(file.arr[j], ":"))
+            ;
+        const char *next = j < file.used ? jumpTarget(file.arr[j]) : NULL;
+        if (!next || next[0] == '+' || next[0] == '-')
+            break;
+        for (int k = 0; k < nseen; k++)
+            if (matchStr(next, seen[k]))
+                return 0; // cycle: leave it alone
+        final = target = seen[nseen++] = next;
+    }
+    if (!final)
+        return 0;
+    snprintf(buf, sizeof(buf), "jmp.w %s", final);
+    *out = pushToArray(*out, buf);
+    return 1;
+}
+
+/**
  * @brief Create an array of strings from a file
     without comment and leading/trailing white spaces.
     Accept an ASM file as argument or stdin.
@@ -274,6 +532,19 @@ dynArray optimizeAsm(dynArray file, const dynArray bss, const size_t quietdisp)
                     continue;
                 }
                 freedynArray(r);
+            }
+
+            /* Control flow: compare + branch fusion (before the older, narrower
+               compare patterns below), branch over brl, jump threading */
+            size_t done = fuseCompare(file, i, &text_opt);
+            if (!done)
+                done = branchOverBrl(file, i, &text_opt);
+            if (!done)
+                done = threadJump(file, i, &text_opt);
+            if (done) {
+                i += done;
+                opted += 1;
+                continue;
             }
 
             if (startWith(file.arr[i], "st")) {
