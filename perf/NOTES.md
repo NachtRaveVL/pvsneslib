@@ -291,6 +291,21 @@ Variables d'environnement de 816-opt : `OPT816_NOFLOW=1` désactive l'analyse, `
   - un pointeur global recopié puis additionné à l'indice, au lieu de `[r],y` ;
   - une variable octet relue, étendue puis réécrite sur la pile ;
   - `x/8` signé, qui appelait `tcc__div`.
+- **Suite ciblée sur rick1 (30 septembre 2026)**, en profilant `test_rick_col_map` à chaque étape (lignes par étape de marche) :
+
+  | Version | Étape complète | `test_rick_col_map` |
+  |---|---:|---:|
+  | Niveau 3 installé | 106 | 36 |
+  | + division signée par 2^k en ligne (tcc) | 104 | 33 |
+  | + pointeur + indice octet → `[rK],y` (816-opt) | 102 | 30 |
+  | + opérations sur octets en 8 bits, `inc a` pour un pointeur (816-opt) | 98 | 25 |
+
+  Ajouts dans `flow.c` :
+  - **indice prouvé petit** : `fieldOffsets` accepte un indice dans un pseudo-registre s'il est prouvé compris entre 0 et `$7FFF`, c'est-à-dire un octet étendu à 16 bits ou un `and #N` avec N < `$8000`. Un seul `ldy` à la place de l'addition quand Y est libre jusqu'au dernier accès, sinon un `ldy` avant chaque accès ;
+  - **`byteOps`** : `u8 v op= expr` (`ora`, `and`, `eor`) en 8 bits, en 5 instructions au lieu de 13 ;
+  - **incrément dans A** : dans la passe des valeurs, `inc.b rX / lda.b rX` devient `inc a / sta.b rX` quand A vaut déjà rX.
+
+  Tests ajoutés : `sdivtest`, `ptrtest` (dont les indices négatifs, qui ne doivent pas être transformés) et `bytetest`. abtest contre la chaîne installée : 16 ROMs identiques, 54 écrans identiques, aucune différence.
 - **Bugs attrapés par les tests pendant le développement** : réécritures de tableaux qui se chevauchaient sur X (tri faux), indicateur « X vivant » écrasé (cmptest faux), variables globales partagées entre la NMI et le programme dans un test.
 
 ### Pièges et bugs rencontrés (existaient avant ce travail)

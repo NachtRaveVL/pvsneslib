@@ -884,6 +884,37 @@ static int isDerefOp(const Line *l)
     return 0;
 }
 
+/* Is the pseudo register rI, just before line `at`, a value in 0..$7fff? Its
+   last write in the block must be a zero-extended byte
+   (lda.w #0 / sep #$20 / lda ... / rep #$20 / sta rI) or an "and" with a
+   mask below $8000 just before the store. */
+static int smallIndex(Line *f, int at, const char *op, regset slot)
+{
+    for (int j = at - 1; j >= 1 && !isBlockBoundary(&f[j]); j--) {
+        Line *l = &f[j];
+        if (l->deleted || l->insBefore)
+            return 0;
+        if (!(l->defs & slot))
+            continue;
+        if (!is(l, "sta") || l->size != 'b' || strcmp(l->op, op) != 0 || l->m != M_16)
+            return 0;
+        Line *p = &f[j - 1];
+        if (p->isInsn && is(p, "and") && p->op[0] == '#' && !p->anon[0]) {
+            char *e;
+            const char *num = p->op + 1;
+            long mask = num[0] == '$' ? strtol(num + 1, &e, 16) : strtol(num, &e, 10);
+            return *e == 0 && mask >= 0 && mask < 0x8000;
+        }
+        if (j < 4)
+            return 0;
+        Line *rep = &f[j - 1], *ld = &f[j - 2], *sep = &f[j - 3], *zero = &f[j - 4];
+        return rep->isInsn && strcmp(rep->text, "rep #$20") == 0 && ld->isInsn && is(ld, "lda") && ld->m == M_8
+               && sep->isInsn && strcmp(sep->text, "sep #$20") == 0 && zero->isInsn && is(zero, "lda")
+               && (strcmp(zero->op, "#0") == 0) && !rep->anon[0] && !ld->anon[0] && !sep->anon[0];
+    }
+    return 0;
+}
+
 static int fieldOffsets(Line *f, int n)
 {
     int done = 0;
@@ -892,20 +923,32 @@ static int fieldOffsets(Line *f, int n)
     for (int i = 0; i + 4 < n; i++) {
         Line *clc = &f[i], *ld = &f[i + 1], *adc = &f[i + 2], *st = &f[i + 3];
         if (!clc->isInsn || !is(clc, "clc") || !ld->isInsn || !is(ld, "lda") || ld->size != 'b'
-            || !adc->isInsn || !is(adc, "adc") || adc->op[0] != '#' || !st->isInsn || !is(st, "sta")
+            || !adc->isInsn || !is(adc, "adc") || !st->isInsn || !is(st, "sta")
             || st->size != 'b' || strcmp(ld->op, st->op) != 0 || ld->m != M_16 || st->m != M_16)
             continue;
         int bad = 0;
         for (int j = i; j <= i + 3; j++)
             if (f[j].anon[0] || f[j].busy || f[j].insBefore || f[j].deleted)
                 bad = 1;
-        const char *num = adc->op + 1;
-        char *endp;
-        long c = num[0] == '$' ? strtol(num + 1, &endp, 16) : strtol(num, &endp, 10);
-        if (bad || *endp || c <= 0 || c >= 0x8000)
+        if (bad)
+            continue;
+        /* offset: a constant 1..$7fff, or a pseudo register proven 0..$7fff */
+        long c = -1;
+        regset iSlot = 0;
+        int ind;
+        if (adc->op[0] == '#') {
+            const char *num = adc->op + 1;
+            char *endp;
+            c = num[0] == '$' ? strtol(num + 1, &endp, 16) : strtol(num, &endp, 10);
+            if (*endp || c <= 0 || c >= 0x8000)
+                continue;
+        } else if (adc->size == 'b' && adc->op[0] == 't' && !strchr(adc->op, '+')
+                   && operandSlots(adc->op, &iSlot, &ind) == 1 && !ind) {
+            if (!smallIndex(f, i + 2, adc->op, iSlot))
+                continue;
+        } else
             continue;
         regset kSlot;
-        int ind;
         if (operandSlots(st->op, &kSlot, &ind) != 1 || ind || st->op[0] != 't' || strchr(st->op, '+')
             || endWith(st->op, "h"))
             continue;
@@ -918,8 +961,16 @@ static int fieldOffsets(Line *f, int n)
         if (operandSlots(hOp, &hSlot, &ind) != 1)
             continue;
         regset ptr = kSlot | hSlot;
+        if (iSlot & ptr)
+            continue;
 
-        int deref[32], nderef = 0, ok = 0, j;
+        /* two ways to have the offset in Y at each access:
+           - one ldy where the addition was, Y then untouched up to the last
+             access (Y must be free there);
+           - one ldy before each access (Y free at each one; for a register
+             index, the register must still hold it) */
+        int deref[32], nderef = 0, ok = 0, j, idxChanged = 0, yChanged = 0;
+        int oneLdy = !(clc->in & BIT(R_Y)), eachLdy = 1;
         for (j = i + 4; j < n; j++) {
             Line *l = &f[j];
             if (!(l->in & ptr)) {
@@ -929,29 +980,43 @@ static int fieldOffsets(Line *f, int n)
             if (isBlockBoundary(l) || l->insBefore || l->busy)
                 break;
             if (l->use & ptr) {
-                if (!isDerefOp(l) || l->size != 'b' || strcmp(l->op, derefOp) != 0 || nderef == 32
-                    || (l->in & BIT(R_Y)))
+                if (!isDerefOp(l) || l->size != 'b' || strcmp(l->op, derefOp) != 0 || nderef == 32)
                     break;
+                if (yChanged)
+                    oneLdy = 0;
+                if ((l->in & BIT(R_Y)) || idxChanged)
+                    eachLdy = 0;
                 deref[nderef++] = j;
             }
             if (l->defs & ptr)
                 break;
+            if (l->defs & iSlot)
+                idxChanged = 1; // the index register no longer holds the index
+            if (l->defs & BIT(R_Y))
+                yChanged = 1;
         }
-        if (!ok || !nderef)
+        if (!ok || !nderef || (!oneLdy && !eachLdy))
             continue;
 
+        char ldy[80];
+        if (c >= 0)
+            snprintf(ldy, sizeof(ldy), "ldy.w #%ld", c);
+        else
+            snprintf(ldy, sizeof(ldy), "ldy.b %s", adc->op);
         for (int k = i; k <= i + 3; k++)
             f[k].deleted = 1;
         for (int k = i; k < j; k++)
             f[k].busy = 1;
+        if (oneLdy)
+            clc->insBefore = strdup(ldy); // emitted in place of the removed addition
         for (int k = 0; k < nderef; k++) {
             Line *l = &f[deref[k]];
-            snprintf(buf, sizeof(buf), "ldy.w #%ld", c);
-            l->insBefore = strdup(buf);
+            if (!oneLdy)
+                l->insBefore = strdup(ldy);
             snprintf(buf, sizeof(buf), "%s.b %s,y", l->mn, derefOp);
             setText(l, buf);
         }
-        DBG("champ +%ld via %s (%d acces)", c, st->op, nderef);
+        DBG("champ %s via %s (%d acces)", adc->op, st->op, nderef);
         done++;
     }
     return done;
@@ -1218,6 +1283,23 @@ static int redundantValues(Line *f, int n)
         int op = vlOperand(&v, l->op, 0);
         if (op < 0)
             continue;
+        /* inc.b rX / lda.b rX with A == rX before: inc a / sta.b rX (same
+           values and flags; the store goes away later if rX is dead) */
+        if ((is(l, "inc") || is(l, "dec")) && l->size == 'b' && op >= VL_PSEUDO && op < VL_PSEUDO + NSLOT
+            && st[VL_A] == st[op] && i + 1 < n) {
+            Line *nx = &f[i + 1];
+            if (nx->isInsn && is(nx, "lda") && nx->size == 'b' && strcmp(nx->op, l->op) == 0 && !nx->anon[0]
+                && !nx->busy && !nx->insBefore && !nx->deleted && !nx->keep && nx->m == M_16) {
+                char t[300];
+                snprintf(t, sizeof(t), "sta.b %s", l->op);
+                DBG("valeur: %s / %s -> %s a / %s", l->text, nx->text, l->mn, t);
+                setText(l, is(l, "inc") ? "inc a" : "dec a");
+                setText(nx, t);
+                done++;
+                i++; // the next line has just been rewritten
+            }
+            continue;
+        }
         int nzDead = !(l->out & FLAGS_NZ);
         if (is(l, "lda") || is(l, "ldx") || is(l, "ldy")) {
             int r = is(l, "lda") ? VL_A : is(l, "ldx") ? VL_X : VL_Y;
@@ -1261,6 +1343,71 @@ static int redundantValues(Line *f, int n)
     free(tmp);
     for (int k = VL_PSEUDO + NSLOT; k < v.nloc; k++)
         free(v.text[k]);
+    return done;
+}
+
+/* Byte operation on a byte variable ("u8 v |= expr"): tcc zero-extends both
+   operands, operates in 16 bits and stores the low byte:
+        lda.w #0 / sep #$20 / lda V / rep #$20 / sta.b rT
+        lda.w #0 / sep #$20 / lda E / rep #$20 / ora.b rT / sep #$20 / sta V / rep #$20
+   becomes, in 8 bits:
+        sep #$20 / lda E / ora V / sta V / rep #$20
+   (same for and, eor). rT must be dead after, A and N/Z too (their values
+   change), V a stack slot or pseudo register, E must not use rT. */
+static int byteOps(Line *f, int n)
+{
+    int done = 0;
+    char buf[300];
+
+    for (int i = 0; i + 12 < n; i++) {
+        Line *l = &f[i];
+        if (!(l->isInsn && is(l, "lda") && strcmp(l->op, "#0") == 0 && l->m == M_16))
+            continue;
+        int bad = 0;
+        for (int j = i; j <= i + 12; j++)
+            if (!f[j].isInsn || f[j].anon[0] || f[j].busy || f[j].insBefore || f[j].deleted || f[j].keep
+                || f[j].inIf)
+                bad = 1;
+        if (bad)
+            continue;
+        Line *v1 = &f[i + 2], *st = &f[i + 4], *z2 = &f[i + 5], *e = &f[i + 7], *op = &f[i + 9],
+             *sv = &f[i + 11];
+        if (strcmp(f[i + 1].text, "sep #$20") != 0 || !is(v1, "lda") || strcmp(f[i + 3].text, "rep #$20") != 0
+            || !is(st, "sta") || st->size != 'b' || !is(z2, "lda") || strcmp(z2->op, "#0") != 0
+            || strcmp(f[i + 6].text, "sep #$20") != 0 || !is(e, "lda") || strcmp(f[i + 8].text, "rep #$20") != 0
+            || !(is(op, "ora") || is(op, "and") || is(op, "eor")) || op->size != 'b'
+            || strcmp(op->op, st->op) != 0 || strcmp(f[i + 10].text, "sep #$20") != 0 || !is(sv, "sta")
+            || strcmp(sv->op, v1->op) != 0 || strcmp(f[i + 12].text, "rep #$20") != 0)
+            continue;
+        /* V: a stack slot or a pseudo register (no side effect, same text) */
+        regset vs, ts, es;
+        int ind;
+        int vStack = endWith(v1->op, ",s") && !strchr(v1->op, '(') && !strchr(v1->op, '[');
+        int vPseudo = operandSlots(v1->op, &vs, &ind) == 1 && !ind && v1->op[0] == 't' && !strchr(v1->op, ',');
+        if (!vStack && !vPseudo)
+            continue;
+        if (operandSlots(st->op, &ts, &ind) != 1 || ind || st->op[0] != 't')
+            continue;
+        if (operandSlots(e->op, &es, &ind) < 0 || (es & ts) || (vPseudo && (vs & ts)))
+            continue;
+        if (op->out & ts)
+            continue; // the temporary is still needed
+        if (f[i + 12].out & (BIT(R_A) | FLAGS_NZ))
+            continue; // A (high byte) and N/Z change
+        const char *vop = v1->op;
+        f[i].insBefore = NULL;
+        snprintf(buf, sizeof(buf), "sep #$20\n%s%s %s\n%s%s %s\nsta%s %s\nrep #$20", e->mn,
+                 e->size ? (e->size == 'b' ? ".b" : e->size == 'w' ? ".w" : ".l") : "", e->op, op->mn,
+                 v1->size ? (v1->size == 'b' ? ".b" : v1->size == 'w' ? ".w" : ".l") : "", vop,
+                 sv->size ? (sv->size == 'b' ? ".b" : sv->size == 'w' ? ".w" : ".l") : "", vop);
+        f[i].insBefore = strdup(buf);
+        for (int j = i; j <= i + 12; j++) {
+            f[j].deleted = 1;
+            f[j].busy = 1;
+        }
+        DBG("octet: %s %s |%s", op->mn, vop, e->op);
+        done++;
+    }
     return done;
 }
 
@@ -1367,6 +1514,7 @@ static void optimizeFunc(Func *fn, size_t *total, size_t *totalIdx)
         int x = indexArrays(fn->f, fn->n);
         x += unrollShifts(fn->f, fn->n);
         x += fieldOffsets(fn->f, fn->n);
+        x += byteOps(fn->f, fn->n);
         int r = x ? 0 : removeDead(fn->f, fn->n);
         if (!x && !r)
             x = redundantValues(fn->f, fn->n);
