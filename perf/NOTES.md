@@ -154,7 +154,7 @@ L'outillage de test de `mos2wla` (émulateur sans interface, comparaison d'écra
 
 **Recommandation :** commencer par le niveau 1 et la fusion comparaison + branchement, mesurer avec `tests/bench`, puis décider. Optimiser tcc peut servir de solution d'attente pendant qu'on surveille l'intégration d'un fork 65816 dans le llvm-mos officiel.
 
-**Décision (28 septembre 2026) : piste retenue.** Les niveaux 1 à 3 sont faits et mesurés (§8). Les gains réels dépassent les estimations ci-dessus : −11 % au niveau 1, −19 % cumulés au niveau 2, −48 % cumulés au niveau 3. Le niveau 4 n'est pas commencé.
+**Décision (28 septembre 2026) : piste retenue.** Les niveaux 1 à 3 sont faits et mesurés (§8). Les gains réels dépassent les estimations ci-dessus : −11 % au niveau 1, −19 % cumulés au niveau 2, −48 % cumulés au niveau 3. Niveau 4 commencé le 29 septembre : division et modulo signés par une puissance de 2 constante, générés en ligne au lieu d'appeler `tcc__div` (`816-gen.c`, testés par `sdivtest`). Effet sur rick1 : −2 % par étape (un `x/8` par appel de `test_rick_col_map`).
 
 ## 6. Prochaines étapes possibles
 
@@ -273,6 +273,24 @@ Variables d'environnement de 816-opt : `OPT816_NOFLOW=1` désactive l'analyse, `
   - **multest dans MesenCE** (émulation au cycle près du multiplicateur et du diviseur) : `OK`, toutes les voies de `tcc__mul`, `tcc__mull` et `tcc__udiv`/`tcc__div`, avec 2 379 NMI qui calculent aussi. Les délais d'attente du niveau 1 sont donc validés. Il reste à tester sur une vraie console.
   - **geeklife** : testé par l'auteur dans **MesenCE**, fonctionne parfaitement (effets mode 7, HDMA, moteur de sprites). Mesen émule au cycle près le multiplicateur et le diviseur ; comme les scores utilisent `% 10`, `/ 10` (`tcc__udiv`, voie matérielle) et `* 10` (`tcc__mul`), les délais d'attente sont validés pour ces voies.
   - **rick1** : un sprite qui montait pendant le défilement venait d'un bug du jeu (`bclmz += 32` oublié dans `scroll_up`), et non de la chaîne. L'état de Rick suit la même séquence qu'avec la chaîne d'origine, avec une frame d'avance.
+- **Mesure en jeu réel (rick1, 29 septembre 2026)**, sur le même passage joué et le même code source (niveau 1 : marche, chute dans le puits, défilement, rocher) :
+
+  | rick1 | Chaîne d'origine | Chaîne actuelle | Écart |
+  |---|---:|---:|---:|
+  | Charge médiane en marche (lignes par étape de jeu) | 127 | 90 | −29 % |
+  | Durée du défilement vertical | 32 frames | 24 frames | −25 % |
+  | Frames en retard (`lag_frame_counter`) | 38 | 25 | −34 % |
+
+  Méthode :
+  - Dans une **copie** de la bibliothèque, `WaitForVBlank` relève la ligne de balayage courante (`$2137`, puis `$213F`, puis `$213D` lu deux fois) dans une variable `perf_vline`, lue à chaque frame avec `RUN_ROM_WATCH`. La charge d'une étape de jeu = lignes écoulées entre le début du VBlank et cet appel.
+  - La même instrumentation est ajoutée aux deux bibliothèques : celle de `develop` (compilée avec le 816-opt d'origine) et l'actuelle.
+  - Dans snes9x, rick1 tourne en PAL avec overscan : 312 lignes, VBlank à la ligne 240. Le jeu avance à 30 Hz, soit deux `WaitForVBlank` par étape.
+- **Profil de rick1 (chaîne actuelle, marche, lignes par étape)**, obtenu avec des marques `perf_mark` / `perf_begin` / `perf_end` ajoutées dans une copie du jeu : étape complète 106, dont `draw_entities` 103, dont animation de Rick (`gere_rick`) 53, dont collision avec la carte (`test_rick_col_map`) 36, soit un tiers de l'étape. Le reste de la boucle de `draw_entities` sur ses 13 entités coûte environ 28 lignes. Motifs coûteux relevés dans `test_rick_col_map` :
+  - un pointeur local post-incrémenté (`*pt_map++`), rechargé depuis la pile et réécrit à chaque accès ;
+  - la lecture d'un octet étendue à 16 bits (`lda #0 / sep / lda [r] / rep`) ;
+  - un pointeur global recopié puis additionné à l'indice, au lieu de `[r],y` ;
+  - une variable octet relue, étendue puis réécrite sur la pile ;
+  - `x/8` signé, qui appelait `tcc__div`.
 - **Bugs attrapés par les tests pendant le développement** : réécritures de tableaux qui se chevauchaient sur X (tri faux), indicateur « X vivant » écrasé (cmptest faux), variables globales partagées entre la NMI et le programme dans un test.
 
 ### Pièges et bugs rencontrés (existaient avant ce travail)
