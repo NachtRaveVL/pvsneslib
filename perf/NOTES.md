@@ -154,7 +154,7 @@ L'outillage de test de `mos2wla` (émulateur sans interface, comparaison d'écra
 
 **Recommandation :** commencer par le niveau 1 et la fusion comparaison + branchement, mesurer avec `tests/bench`, puis décider. Optimiser tcc peut servir de solution d'attente pendant qu'on surveille l'intégration d'un fork 65816 dans le llvm-mos officiel.
 
-**Décision (28 septembre 2026) : piste retenue.** Les niveaux 1 à 3 sont faits et mesurés (§8). Les gains réels dépassent les estimations ci-dessus : −11 % au niveau 1, −19 % cumulés au niveau 2, −48 % cumulés au niveau 3. Niveau 4 commencé le 29 septembre : division et modulo signés par une puissance de 2 constante, générés en ligne au lieu d'appeler `tcc__div` (`816-gen.c`, testés par `sdivtest`). Effet sur rick1 : −2 % par étape (un `x/8` par appel de `test_rick_col_map`).
+**Décision (28 septembre 2026) : piste retenue.** Les niveaux 1 à 3 sont faits et mesurés (§8). Les gains réels dépassent les estimations ci-dessus : −11 % au niveau 1, −19 % cumulés au niveau 2, −48 % cumulés au niveau 3. Niveau 4 commencé le 29 septembre : division et modulo signés par une puissance de 2 constante, générés en ligne au lieu d'appeler `tcc__div` (`816-gen.c`, testés par `sdivtest`). Effet sur rick1 : −2 % par étape (un `x/8` par appel de `test_rick_col_map`). Puis multiplication par une constante ayant 2 ou 3 bits à 1 (tailles de structures : 6, 10, 12, 20, 24, 72…) calculée en ligne par décalages et additions au lieu d'appeler `tcc__mul` (`cmultest`) : rick1 −8 % par étape (`&tab_entities[i]`, 72 octets), banc 215 → 202 frames.
 
 ## 6. Prochaines étapes possibles
 
@@ -273,6 +273,7 @@ Variables d'environnement de 816-opt : `OPT816_NOFLOW=1` désactive l'analyse, `
   - **multest dans MesenCE** (émulation au cycle près du multiplicateur et du diviseur) : `OK`, toutes les voies de `tcc__mul`, `tcc__mull` et `tcc__udiv`/`tcc__div`, avec 2 379 NMI qui calculent aussi. Les délais d'attente du niveau 1 sont donc validés. Il reste à tester sur une vraie console.
   - **geeklife** : testé par l'auteur dans **MesenCE**, fonctionne parfaitement (effets mode 7, HDMA, moteur de sprites). Mesen émule au cycle près le multiplicateur et le diviseur ; comme les scores utilisent `% 10`, `/ 10` (`tcc__udiv`, voie matérielle) et `* 10` (`tcc__mul`), les délais d'attente sont validés pour ces voies.
   - **rick1** : un sprite qui montait pendant le défilement venait d'un bug du jeu (`bclmz += 32` oublié dans `scroll_up`), et non de la chaîne. L'état de Rick suit la même séquence qu'avec la chaîne d'origine, avec une frame d'avance.
+  - **rick1, chaîne complète du 30 septembre** (tcc avec division signée en ligne, 816-opt avec `byteOps` et `[rK],y`, bibliothèque niveau 1) : fonctionne parfaitement dans MesenCE, après correction de deux bugs du jeu. Le premier est `scroll_up` ; le second, un `strcpy` de `game_loadhighscores` qui débordait sur `world_start_crds` avec une SRAM vierge et faisait sauter le niveau 1 (corrigé par `memcpy(…, 10)`).
 - **Mesure en jeu réel (rick1, 29 septembre 2026)**, sur le même passage joué et le même code source (niveau 1 : marche, chute dans le puits, défilement, rocher) :
 
   | rick1 | Chaîne d'origine | Chaîne actuelle | Écart |
@@ -299,6 +300,7 @@ Variables d'environnement de 816-opt : `OPT816_NOFLOW=1` désactive l'analyse, `
   | + division signée par 2^k en ligne (tcc) | 104 | 33 |
   | + pointeur + indice octet → `[rK],y` (816-opt) | 102 | 30 |
   | + opérations sur octets en 8 bits, `inc a` pour un pointeur (816-opt) | 98 | 25 |
+  | + multiplication par une constante à 2 ou 3 bits en ligne (tcc) | 90 | 27 |
 
   Ajouts dans `flow.c` :
   - **indice prouvé petit** : `fieldOffsets` accepte un indice dans un pseudo-registre s'il est prouvé compris entre 0 et `$7FFF`, c'est-à-dire un octet étendu à 16 bits ou un `and #N` avec N < `$8000`. Un seul `ldy` à la place de l'addition quand Y est libre jusqu'au dernier accès, sinon un `ldy` avant chaque accès ;
