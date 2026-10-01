@@ -115,8 +115,10 @@ int main(int argc, char **argv)
         freedynArray(optAsm);
         if (getenv("OPT816_NOPEEP2")) // debug: flow output as is
             optAsm = flowAsm;
-        else
+        else {
+            peepAfterFlow = 1; // A may now be reused: no rule that assumes it is not
             optAsm = optimizeAsm(flowAsm, bss, f816opt_args.quietmode);
+        }
     }
 
     // write to file

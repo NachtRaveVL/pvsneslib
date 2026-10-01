@@ -33,6 +33,8 @@
 char **locals_names = NULL;
 size_t locals_names_used = 0, locals_names_size = 0;
 
+int peepAfterFlow = 0;
+
 static void pushLocalName(char *name)
 {
     if (locals_names_used == locals_names_size) {
@@ -912,11 +914,13 @@ dynArray optimizeAsm(dynArray file, const dynArray bss, const size_t quietdisp)
                     }
 
                     /* Store accu to preg, asl preg => asl accu, store accu to preg
-                        FIXME: is this safe? can we rely on code not making
-                       assumptions about the contents of the accu after the shift?
+                       Safe on tcc output only: tcc reloads A after a store. The
+                       flow analysis removes such reloads, so the pass after it
+                       must not apply this rule (the flow pass does the same
+                       rewrite itself, with the liveness of A).
                      */
                     snprintf(snp_buf1, sizeof(snp_buf1), "asl.b tcc__%s", r.arr[1]);
-                    if (matchStr(file.arr[i + 1], snp_buf1)) {
+                    if (!peepAfterFlow && matchStr(file.arr[i + 1], snp_buf1)) {
                         text_opt = pushToArray(text_opt, "asl a");
                         text_opt = pushToArray(text_opt, file.arr[i]);
 
@@ -1286,7 +1290,9 @@ dynArray optimizeAsm(dynArray file, const dynArray bss, const size_t quietdisp)
                 continue;
             }
 
-            r = regexMatchGroups(file.arr[i], "adc #(.{0,})$", 2);
+            /* adc #c / sta rX / inc rX / inc rX => adc #c + 2 / sta rX: A ends
+               with another value, safe on tcc output only (see peepAfterFlow) */
+            r = peepAfterFlow ? (dynArray){0} : regexMatchGroups(file.arr[i], "adc #(.{0,})$", 2);
             if (r.arr != NULL) {
                 r1 = regexMatchGroups(file.arr[i + 1], "sta.b (tcc__[fr][0-9]{0,})$", 2);
                 if (r1.arr != NULL) {

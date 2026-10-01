@@ -1202,6 +1202,13 @@ static void vlTransfer(VLocs *v, const Line *l, const int *in, int *out)
     vlCanon(out, nl);
 }
 
+/* read-modify-write instruction that also exists on A */
+static int isRmwA(const Line *l)
+{
+    return l->isInsn
+           && (is(l, "inc") || is(l, "dec") || is(l, "asl") || is(l, "lsr") || is(l, "rol") || is(l, "ror"));
+}
+
 static int redundantValues(Line *f, int n)
 {
     VLocs v;
@@ -1283,21 +1290,64 @@ static int redundantValues(Line *f, int n)
         int op = vlOperand(&v, l->op, 0);
         if (op < 0)
             continue;
-        /* inc.b rX / lda.b rX with A == rX before: inc a / sta.b rX (same
-           values and flags; the store goes away later if rX is dead) */
-        if ((is(l, "inc") || is(l, "dec")) && l->size == 'b' && op >= VL_PSEUDO && op < VL_PSEUDO + NSLOT
-            && st[VL_A] == st[op] && i + 1 < n) {
-            Line *nx = &f[i + 1];
-            if (nx->isInsn && is(nx, "lda") && nx->size == 'b' && strcmp(nx->op, l->op) == 0 && !nx->anon[0]
-                && !nx->busy && !nx->insBefore && !nx->deleted && !nx->keep && nx->m == M_16) {
-                char t[300];
-                snprintf(t, sizeof(t), "sta.b %s", l->op);
-                DBG("valeur: %s / %s -> %s a / %s", l->text, nx->text, l->mn, t);
-                setText(l, is(l, "inc") ? "inc a" : "dec a");
-                setText(nx, t);
+        /* inc.b rX / asl.b rX ... / lda.b rX with A == rX before: the same
+           operations on A, then sta.b rX (same values and flags: each
+           operation sets N/Z/C as on memory, and the lda set N/Z from the
+           final value like the last operation; the store goes away later if
+           rX is dead) */
+        if (isRmwA(l) && l->size == 'b' && op >= VL_PSEUDO && op < VL_PSEUDO + NSLOT && st[VL_A] == st[op]) {
+            int j = i;
+            while (j < n && isRmwA(&f[j]) && f[j].size == 'b' && strcmp(f[j].op, l->op) == 0 && !f[j].anon[0]
+                   && !f[j].busy && !f[j].insBefore && !f[j].deleted && !f[j].keep && !f[j].inIf
+                   && f[j].m == M_16)
+                j++;
+            Line *nx = j < n ? &f[j] : NULL;
+            /* ending with ldx.b rX / ldy.b rX and A dead after: same on A, then
+               sta.b rX / tax (tax sets N/Z from the same value as ldx) */
+            int toX = nx && (is(nx, "ldx") || is(nx, "ldy")) && !(nx->out & BIT(R_A));
+            if (nx && nx->isInsn && (is(nx, "lda") || toX) && nx->size == 'b' && strcmp(nx->op, l->op) == 0
+                && !nx->anon[0] && !nx->busy && !nx->insBefore && !nx->deleted && !nx->keep && !nx->inIf
+                && nx->m == M_16) { // X/Y are 16 bits in every analysed function
+                char t[300], store[300];
+                snprintf(store, sizeof(store), "sta.b %s", l->op); // before l is rewritten
+                for (int k = i; k < j; k++) {
+                    snprintf(t, sizeof(t), "%s a", f[k].mn);
+                    DBG("valeur: %s -> %s", f[k].text, t);
+                    setText(&f[k], t);
+                }
+                if (toX) {
+                    nx->insBefore = strdup(store);
+                    setText(nx, is(nx, "ldx") ? "tax" : "tay");
+                } else
+                    setText(nx, store);
                 done++;
-                i++; // the next line has just been rewritten
+                i = j; // the following lines have just been rewritten
             }
+            continue;
+        }
+        /* operation reading a pseudo register that holds a constant: read the
+           constant (faster); that holds a stack slot, and dead after: read the
+           slot (the copy into the register then becomes dead) */
+        if ((is(l, "adc") || is(l, "sbc") || is(l, "cmp") || is(l, "and") || is(l, "ora") || is(l, "eor"))
+            && l->size == 'b' && op >= VL_PSEUDO && op < VL_PSEUDO + NSLOT) {
+            int imm = -1, slot = -1;
+            for (int k = VL_PSEUDO + NSLOT; k < nl; k++)
+                if (st[k] == st[op]) {
+                    if (v.text[k][0] == '#' && imm < 0)
+                        imm = k;
+                    else if (v.isStack[k] && slot < 0)
+                        slot = k;
+                }
+            char t[300];
+            if (imm >= 0)
+                snprintf(t, sizeof(t), "%s.w %s", l->mn, v.text[imm]);
+            else if (slot >= 0 && !(l->out & BIT(R_PSEUDO + (op - VL_PSEUDO))))
+                snprintf(t, sizeof(t), "%s %s", l->mn, v.text[slot]);
+            else
+                continue;
+            DBG("valeur: %s -> %s", l->text, t);
+            setText(l, t);
+            done++;
             continue;
         }
         int nzDead = !(l->out & FLAGS_NZ);

@@ -159,6 +159,14 @@ L'outillage de test de `mos2wla` (émulateur sans interface, comparaison d'écra
   - `816-gen.c` : le `return` d'une fonction qui renvoie un entier ne recopie plus le mot de banque (`tcc__r0h`). Cette réduction ne vaut **que** pour le `return` : ailleurs, tcc retype en `int` des valeurs qui sont des pointeurs (copie de l'ancienne valeur dans `*p++`, `gv_dup`). Une première version qui réduisait toutes les copies typées entier cassait rick1 (carte illisible) sans qu'aucun test ni abtest ne le voie ; `pinctest` (pointeurs incrémentés vers deux banques en alternance) le détecte désormais (36 erreurs) ;
   - 816-opt : suppression d'un saut inconditionnel vers l'étiquette qui le suit, et durée de vie des registres de retour des fonctions `static` calculée comme plus petit point fixe (une fonction récursive gardait sinon ses propres registres de retour vivants).
 
+  Puis (1er octobre) banc 196 → 176 frames (151 en FastROM), SORT 65 → 51, MAP 35 → 29, rick1 inchangé :
+  - **`u8` variadiques corrigés** (`tccgen.c`, `gfunc_param_typed`) : un `char` ou un `bool` passé dans `...` est promu en `int` (2 octets), ce que lit `va_arg(ap, int)` dans la bibliothèque (`%d`, `%u`, `%c`). COPY affiche enfin 17. Test `vatest` (13 erreurs avant, 0 après). Aucun écran d'exemple ne change ;
+  - **opérandes lus directement** (`flow.c`, passe des valeurs) : `adc/sbc/cmp/and/ora/eor` sur un pseudo-registre qui contient une constante lit `#c` ; s'il contient une case de pile et qu'il est mort ensuite, l'opération lit `n,s` et la copie devient du code mort. Exemple : la borne `99 - i` de SORT passe de 11 à 7 instructions ;
+  - **calculs sur A** (`flow.c`) : une suite `inc/dec/asl/lsr/rol/ror` faite en mémoire sur un pseudo-registre qui vaut déjà A, puis relu par `lda` (ou par `ldx`/`ldy` si A est mort ensuite), se fait sur A : 2 cycles par opération au lieu de 7 ;
+  - **bug latent corrigé dans 816-opt** : deux anciennes règles du peephole (`sta.b rX / asl.b rX` → `asl a / sta.b rX`, et `adc #c / sta rX / inc rX / inc rX` → `adc #c + 2`) changent la valeur de A en supposant qu'elle n'est plus lue. C'est vrai sur la sortie de tcc, qui recharge toujours A, mais plus après l'analyse de flot, qui supprime ces rechargements. Elles ne s'appliquent plus que dans la passe qui précède l'analyse. Trouvé par un test assembleur, jamais observé sur du vrai code.
+
+  Tests assembleur ajoutés : `operand_ok`, `operand_push` (pas de lecture de `n,s` après un `pha`), `rmw_chain`, `rmw_index`.
+
 ## 6. Prochaines étapes possibles
 
 ### Sur la piste retenue (optimiser 816-tcc)
@@ -278,6 +286,7 @@ Variables d'environnement de 816-opt : `OPT816_NOFLOW=1` désactive l'analyse, `
   - **rick1** : un sprite qui montait pendant le défilement venait d'un bug du jeu (`bclmz += 32` oublié dans `scroll_up`), et non de la chaîne. L'état de Rick suit la même séquence qu'avec la chaîne d'origine, avec une frame d'avance.
   - **rick1, chaîne complète du 30 septembre** (tcc avec division signée en ligne, 816-opt avec `byteOps` et `[rK],y`, bibliothèque niveau 1) : fonctionne parfaitement dans MesenCE, après correction de deux bugs du jeu. Le premier est `scroll_up` ; le second, un `strcpy` de `game_loadhighscores` qui débordait sur `world_start_crds` avec une SRAM vierge et faisait sauter le niveau 1 (corrigé par `memcpy(…, 10)`).
   - **Bibliothèque** : `libc_c.c` est du C compilé par tcc et 816-opt. Il faut donc reconstruire la bibliothèque (`make KEEP_LIB=1 clean`, puis `make MAKE=make release` depuis PowerShell) à chaque nouvelle version de l'un des deux.
+  - **rick1 et geeklife, chaîne du 1er octobre** (coût des appels : sauvegardes sur 2 octets, `return` entier sans mot de banque, plus petit point fixe des registres de retour) : fonctionnent tous les deux.
   - **rick1 et geeklife, chaîne du 30 septembre au soir** (tcc avec multiplication par une constante en ligne, bibliothèque reconstruite avec cette chaîne) : fonctionnent tous les deux.
 - **Mesure en jeu réel (rick1, 29 septembre 2026)**, sur le même passage joué et le même code source (niveau 1 : marche, chute dans le puits, défilement, rocher) :
 
@@ -328,4 +337,4 @@ Variables d'environnement de 816-opt : `OPT816_NOFLOW=1` désactive l'analyse, `
 
 - Restent logiciels : les divisions par un diviseur ≥ 256, les divisions 32 bits (`tcc__divl`/`tcc__udivl`) et les multiplications appelées depuis une interruption pendant un calcul matériel.
 - L'affinage des registres de retour ne concerne que les fonctions `static` ; pour les autres, main compris, il reste prudent.
-- Le bug de tcc sur les `u8` variadiques (§3) est toujours là : COPY affiche 6161 au lieu de 17.
+- Le bug de tcc sur les `u8` variadiques (§3) est corrigé depuis le 1er octobre (`vatest`) : COPY affiche 17.
