@@ -357,6 +357,27 @@ static size_t threadJump(const dynArray file, size_t i, dynArray *out)
 }
 
 /**
+ * @brief An unconditional jump to a label that directly follows it (only labels
+    in between) is useless: the code falls through to the same place.
+ */
+static size_t jumpToNext(const dynArray file, size_t i)
+{
+    char def[MAXLEN_LINE];
+    const char *target = jumpTarget(file.arr[i]);
+
+    if (!target || target[0] == '+' || target[0] == '-')
+        return 0;
+    snprintf(def, sizeof(def), "%s:", target);
+    for (size_t j = i + 1; j < file.used; j++) {
+        if (matchStr(file.arr[j], def))
+            return 1;
+        if (!endWith(file.arr[j], ":") && !matchStr(file.arr[j], "+") && !matchStr(file.arr[j], "-"))
+            break;
+    }
+    return 0;
+}
+
+/**
  * @brief Create an array of strings from a file
     without comment and leading/trailing white spaces.
     Accept an ASM file as argument or stdin.
@@ -539,6 +560,8 @@ dynArray optimizeAsm(dynArray file, const dynArray bss, const size_t quietdisp)
             size_t done = fuseCompare(file, i, &text_opt);
             if (!done)
                 done = branchOverBrl(file, i, &text_opt);
+            if (!done)
+                done = jumpToNext(file, i);
             if (!done)
                 done = threadJump(file, i, &text_opt);
             if (done) {

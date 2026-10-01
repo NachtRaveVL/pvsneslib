@@ -1628,34 +1628,63 @@ dynArray flowOptimize(dynArray file, size_t quiet)
     }
 
     /* 3. analysis, then return registers of the static functions from the
-       liveness after their calls (a few rounds for chains of calls) */
+       liveness after their calls. Least fixpoint: start with no return
+       register live and grow until stable, so that a recursive call does not
+       keep its own return registers alive. A static function is eligible when
+       its address is never taken and all its callers are analysed. */
     for (int k = 0; k < nfn; k++)
         if (!analyseFunc(&fn[k]) && fn[k].n > 0)
             DBG("section non analysee: %s", file.arr[fn[k].hdr]);
-    for (int round = 0; round < 4; round++) {
-        int changed = 0;
-        for (int k = 0; k < nfn; k++) {
-            if (!fn[k].isStatic || fn[k].addrTaken)
-                continue;
-            regset live = 0;
-            int known = 1;
-            for (int g = 0; g < nfn && known; g++)
-                for (int i = 0; i < fn[g].n; i++)
-                    if (isCallTo(&fn[g].f[i], fn[k].name)) {
-                        if (!fn[g].ok)
-                            known = 0;
-                        live |= fn[g].f[i].out & RETREGS;
-                    }
-            if (known && live != fn[k].retLive) {
-                DBG("retour %s : %llx -> %llx", fn[k].name, fn[k].retLive, live);
-                fn[k].retLive = live;
-                analyseFunc(&fn[k]);
-                changed = 1;
-            }
+    int *eligible = calloc(nfn ? nfn : 1, sizeof(int)), neligible = 0;
+    for (int k = 0; k < nfn; k++) {
+        if (!fn[k].isStatic || fn[k].addrTaken || !fn[k].ok)
+            continue;
+        eligible[k] = 1;
+        for (int g = 0; g < nfn && eligible[k]; g++)
+            for (int i = 0; i < fn[g].n; i++)
+                if (isCallTo(&fn[g].f[i], fn[k].name) && !fn[g].ok) {
+                    eligible[k] = 0;
+                    break;
+                }
+        if (eligible[k]) {
+            fn[k].retLive = 0;
+            neligible++;
         }
-        if (!changed)
-            break;
     }
+    if (neligible) {
+        int stable = 0;
+        for (int k = 0; k < nfn; k++)
+            if (eligible[k])
+                analyseFunc(&fn[k]);
+        for (int round = 0; round < 64 && !stable; round++) {
+            stable = 1;
+            for (int k = 0; k < nfn; k++) {
+                if (!eligible[k])
+                    continue;
+                regset live = fn[k].retLive;
+                for (int g = 0; g < nfn; g++)
+                    for (int i = 0; i < fn[g].n; i++)
+                        if (isCallTo(&fn[g].f[i], fn[k].name))
+                            live |= fn[g].f[i].out & RETREGS;
+                if (live != fn[k].retLive) {
+                    DBG("retour %s : %llx -> %llx", fn[k].name, fn[k].retLive, live);
+                    fn[k].retLive = live;
+                    stable = 0;
+                }
+            }
+            if (!stable)
+                for (int k = 0; k < nfn; k++)
+                    analyseFunc(&fn[k]);
+        }
+        if (!stable) { // no fixpoint reached: back to the safe assumption
+            for (int k = 0; k < nfn; k++)
+                if (eligible[k])
+                    fn[k].retLive = RETREGS;
+            for (int k = 0; k < nfn; k++)
+                analyseFunc(&fn[k]);
+        }
+    }
+    free(eligible);
 
     /* 4. optimization of each function */
     for (int k = 0; k < nfn; k++) {
