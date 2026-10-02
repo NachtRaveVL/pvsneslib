@@ -359,6 +359,59 @@ static size_t threadJump(const dynArray file, size_t i, dynArray *out)
 }
 
 /**
+ * @brief Byte read zero-extended to 16 bits:
+        lda.w #0 / [ldy #c /] sep #$20 / lda X / rep #$20
+            =>   [ldy #c /] lda X / and.w #$00FF
+    (9 cycles instead of 14). The 16-bit read also reads the next byte: harmless
+    for memory, not for a hardware register where a read can clear a flag or
+    move a pointer ($2139, $4210...). Hardware registers are volatile, and tcc
+    reads a volatile byte with another form (sep / lda / rep / and.w #$00FF,
+    see VOLATILE_BYTE in 816-gen.c), so every long form here is a non-volatile
+    read: global, stack slot or pointer. Numeric addresses are still left alone
+    (*(u8 *)0x4210 written without volatile). Only N differs (bit 7 of the
+    byte before, 0 after), so the next line must not be a branch or a label.
+    Applied after the flow pass, whose patterns expect the long form.
+ */
+static size_t byteRead(const dynArray file, size_t i, dynArray *out)
+{
+    char buf[MAXLEN_LINE];
+
+    if (!peepAfterFlow || i + 5 >= file.used || !matchStr(file.arr[i], "lda.w #0"))
+        return 0;
+    size_t k = i + 1;
+    const char *ldy = NULL;
+    if (startWith(file.arr[k], "ldy #")) // pointer with an offset
+        ldy = file.arr[k++];
+    if (!matchStr(file.arr[k], "sep #$20") || !startWith(file.arr[k + 1], "lda")
+        || !matchStr(file.arr[k + 2], "rep #$20"))
+        return 0;
+    const char *ld = file.arr[k + 1];
+    const char *op = strchr(ld, ' ');
+    if (!op || strchr(op, '(') || strchr(op, '#'))
+        return 0;
+    op++;
+    int stack = endWith(op, ",s");
+    int pointer = op[0] == '[';
+    if (!stack && !pointer && (isdigit((unsigned char) op[0]) || op[0] == '$' || op[0] == '-'))
+        return 0; // numeric address: may be a hardware register
+    int global = startWith(ld, "lda.l ") || startWith(ld, "lda.w ");
+    if (!stack && !global && !pointer)
+        return 0;
+    if (ldy && !(pointer && endWith(op, ",y")))
+        return 0;
+    const char *nx = file.arr[k + 3];
+    if ((nx[0] == 'b' && !startWith(nx, "bit")) || endWith(nx, ":") || nx[0] == '+' || nx[0] == '-'
+        || nx[0] == '.')
+        return 0;
+    if (ldy)
+        *out = pushToArray(*out, (char *) ldy);
+    *out = pushToArray(*out, (char *) ld);
+    snprintf(buf, sizeof(buf), "and.w #$00FF");
+    *out = pushToArray(*out, buf);
+    return k + 3 - i;
+}
+
+/**
  * @brief An unconditional jump to a label that directly follows it (only labels
     in between) is useless: the code falls through to the same place.
  */
@@ -564,6 +617,8 @@ dynArray optimizeAsm(dynArray file, const dynArray bss, const size_t quietdisp)
                 done = branchOverBrl(file, i, &text_opt);
             if (!done)
                 done = jumpToNext(file, i);
+            if (!done)
+                done = byteRead(file, i, &text_opt);
             if (!done)
                 done = threadJump(file, i, &text_opt);
             if (done) {

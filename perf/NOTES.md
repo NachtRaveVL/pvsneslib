@@ -167,6 +167,12 @@ L'outillage de test de `mos2wla` (émulateur sans interface, comparaison d'écra
 
   Tests assembleur ajoutés : `operand_ok`, `operand_push` (pas de lecture de `n,s` après un `pha`), `rmw_chain`, `rmw_index`.
 
+  Puis lectures d'octets (1er octobre) : banc 176 → 173 frames, rick1 90 → 87 lignes par étape (−3 %) :
+  - **816-opt** (`byteRead`, dans la passe qui suit l'analyse de flot) : `lda.w #0 / [ldy #c /] sep #$20 / lda X / rep #$20` devient `[ldy #c /] lda X / and.w #$00FF`, soit 9 cycles au lieu de 14. Cela vaut pour une globale, une case de pile ou un pointeur. 432 des quelque 520 lectures d'octets de rick1 sont converties. Ni à une adresse numérique, ni avant un branchement (le drapeau N diffère) ;
+  - la lecture sur 16 bits lit aussi l'octet suivant, ce qui est sans effet en mémoire mais pas sur un registre matériel : lire `$2180` avance l'adresse WRAM, lire `$4210` efface le drapeau de NMI. **tcc** (`816-gen.c`, `VOLATILE_BYTE`) lit donc un octet `volatile` sous une autre forme (`sep / lda / rep / and.w #$00FF`), que 816-opt ne touche pas. Pour cela, `gv()` (`tccgen.c`) garde désormais le qualificatif `volatile` dans le type de l'accès mémoire, qu'il perdait ;
+  - **les deux outils vont ensemble** : ce 816-opt avec un ancien 816-tcc élargirait aussi les lectures `volatile` faites par pointeur ;
+  - test `voltest` : lit `$217F` par un pointeur `volatile`, puis vérifie que l'adresse du port `$2180` n'a pas avancé (2 erreurs si tcc ne marque pas le `volatile`) ; test assembleur `byte_read`.
+
 ## 6. Prochaines étapes possibles
 
 ### Sur la piste retenue (optimiser 816-tcc)
@@ -286,6 +292,7 @@ Variables d'environnement de 816-opt : `OPT816_NOFLOW=1` désactive l'analyse, `
   - **rick1** : un sprite qui montait pendant le défilement venait d'un bug du jeu (`bclmz += 32` oublié dans `scroll_up`), et non de la chaîne. L'état de Rick suit la même séquence qu'avec la chaîne d'origine, avec une frame d'avance.
   - **rick1, chaîne complète du 30 septembre** (tcc avec division signée en ligne, 816-opt avec `byteOps` et `[rK],y`, bibliothèque niveau 1) : fonctionne parfaitement dans MesenCE, après correction de deux bugs du jeu. Le premier est `scroll_up` ; le second, un `strcpy` de `game_loadhighscores` qui débordait sur `world_start_crds` avec une SRAM vierge et faisait sauter le niveau 1 (corrigé par `memcpy(…, 10)`).
   - **Bibliothèque** : `libc_c.c` est du C compilé par tcc et 816-opt. Il faut donc reconstruire la bibliothèque (`make KEEP_LIB=1 clean`, puis `make MAKE=make release` depuis PowerShell) à chaque nouvelle version de l'un des deux.
+  - **rick1 et geeklife, chaîne du 1er octobre au matin** (`u8` variadiques, opérandes lus directement, calculs sur A) : fonctionnent tous les deux.
   - **rick1 et geeklife, chaîne du 1er octobre** (coût des appels : sauvegardes sur 2 octets, `return` entier sans mot de banque, plus petit point fixe des registres de retour) : fonctionnent tous les deux.
   - **rick1 et geeklife, chaîne du 30 septembre au soir** (tcc avec multiplication par une constante en ligne, bibliothèque reconstruite avec cette chaîne) : fonctionnent tous les deux.
 - **Mesure en jeu réel (rick1, 29 septembre 2026)**, sur le même passage joué et le même code source (niveau 1 : marche, chute dans le puits, défilement, rocher) :
