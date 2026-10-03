@@ -36,7 +36,21 @@ SRAMSIZE      ?= 00
 COUNTRY       ?= 01
 LICENSEECODE  ?= 00
 VERSION       ?= 00
-ROMBANKS      ?= $(if $(filter 0E 0e,$(strip $(ROMSIZE))),$(if $(HIROM),256,512),8)
+
+# Default ROMBANKS is 8, but doubles beyond 08
+ROMBANKS_08   := 8
+ROMBANKS_09   := 16
+ROMBANKS_0A   := 32
+ROMBANKS_0B   := 64
+ROMBANKS_0C   := 128
+ROMBANKS_0D   := 256
+ROMBANKS_0E   := 512
+ROMBANKS_0a   := 32
+ROMBANKS_0b   := 64
+ROMBANKS_0c   := 128
+ROMBANKS_0d   := 256
+ROMBANKS_0e   := 512
+ROMBANKS      ?= $(or $(ROMBANKS_$(strip $(ROMSIZE))),8)
 
 ifeq ($(HIROM),1)
   ROMMODE  := HIROM
