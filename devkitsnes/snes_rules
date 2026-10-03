@@ -37,7 +37,8 @@ COUNTRY       ?= 01
 LICENSEECODE  ?= 00
 VERSION       ?= 00
 
-# Default ROMBANKS is 8, but doubles beyond 08
+# Default ROMBANKS is 8, but doubles beyond 07
+ROMBANKS_07   := 4
 ROMBANKS_08   := 8
 ROMBANKS_09   := 16
 ROMBANKS_0A   := 32
